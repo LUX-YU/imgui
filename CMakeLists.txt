@@ -115,5 +115,5 @@ install_components(
 
 install(
     FILES       ${IMGUI_HEADERS} ${IMGUI_BACKENDS_HEADERS}
-    DESTINATION ${CMAKE_INSTALL_PREFIX}/include/imgui
+    DESTINATION ${CMAKE_INSTALL_PREFIX}/include
 )
