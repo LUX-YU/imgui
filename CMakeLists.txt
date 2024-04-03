@@ -68,19 +68,22 @@ if(IMGUI_OPENGL3_SUPPORT)
 endif()
 
 if(IMGUI_GLFW_SUPPORT)
+    find_package(glfw3 CONFIG REQUIRED)
     add_component(
-        COMPONENT_NAME  glfw
+        COMPONENT_NAME  glfw3
         STATIC
         NAMESPACE       imgui
         OUTPUT_NAME     imgui_glfw3
     	SOURCE_FILES	${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     )
-    component_add_internal_dependencies(glfw core)
+    target_link_libraries(glfw3 PRIVATE glfw)
+    component_add_internal_dependencies(glfw3 core)
     list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_glfw.h)
-    list(APPEND IMGUI_COMPONENTS glfw)
+    list(APPEND IMGUI_COMPONENTS glfw3)
 endif()
 
 if(IMGUI_VULKAN_SUPPORT)
+    find_package(Vulkan REQUIRED)
     add_component(
         COMPONENT_NAME  vulkan
         STATIC
@@ -88,6 +91,7 @@ if(IMGUI_VULKAN_SUPPORT)
         OUTPUT_NAME     imgui_vulkan
     	SOURCE_FILES	${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
     )
+    target_link_libraries(vulkan PRIVATE Vulkan::Vulkan)
     component_add_internal_dependencies(vulkan core)
     list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_vulkan.h)
     list(APPEND IMGUI_COMPONENTS vulkan)
