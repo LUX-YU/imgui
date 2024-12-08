@@ -105,7 +105,7 @@ if(IMGUI_DIRECTX12_SUPPORT AND WIN32)
         STATIC
         NAMESPACE       imgui
         OUTPUT_NAME     imgui_directx12
-    	SOURCE_FILES	${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_directx12.cpp
+    	SOURCE_FILES	${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
     )
     component_add_internal_dependencies(directx12 core)
     list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx12.h)
