@@ -11,6 +11,7 @@ set(IMGUI_GLFW_SUPPORT      ON CACHE BOOL "Enable glfw")
 set(IMGUI_OPENGL3_SUPPORT   ON CACHE BOOL "Enable opengl3")
 set(IMGUI_VULKAN_SUPPORT    ON CACHE BOOL "Enable vulkan")
 if(WIN32)
+    set(IMGUI_DIRECTX11_SUPPORT OFF CACHE BOOL "Enable directx11")
     set(IMGUI_DIRECTX12_SUPPORT OFF CACHE BOOL "Enable directx12")
 endif()
 
