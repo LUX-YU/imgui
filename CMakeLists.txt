@@ -99,17 +99,39 @@ if(IMGUI_VULKAN_SUPPORT)
     list(APPEND IMGUI_COMPONENTS vulkan)
 endif()
 
+if(IMGUI_DIRECTX11_SUPPORT AND WIN32)
+    add_component(
+        COMPONENT_NAME  directx11
+        STATIC
+        NAMESPACE       imgui
+        OUTPUT_NAME     imgui_directx11
+    	SOURCE_FILES	${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
+    )
+    component_add_internal_dependencies(directx11 core)
+    list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx11.h)
+    list(APPEND IMGUI_COMPONENTS directx11)
+endif()
+
 if(IMGUI_DIRECTX12_SUPPORT AND WIN32)
     add_component(
         COMPONENT_NAME  directx12
         STATIC
         NAMESPACE       imgui
         OUTPUT_NAME     imgui_directx12
-    	SOURCE_FILES	${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_directx12.cpp
+    	SOURCE_FILES	${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
     )
     component_add_internal_dependencies(directx12 core)
     list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx12.h)
     list(APPEND IMGUI_COMPONENTS directx12)
+endif()
+
+if(IMGUI_DIRECTX12_SUPPORT OR IMGUI_DIRECTX11_SUPPORT)
+    target_sources(
+        core
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    )
+    list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_win32.h)
 endif()
 
 install_components(
