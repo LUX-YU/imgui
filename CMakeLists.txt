@@ -11,6 +11,7 @@ set(IMGUI_GLFW_SUPPORT      ON CACHE BOOL "Enable glfw")
 set(IMGUI_OPENGL3_SUPPORT   ON CACHE BOOL "Enable opengl3")
 set(IMGUI_VULKAN_SUPPORT    ON CACHE BOOL "Enable vulkan")
 if(WIN32)
+    set(IMGUI_DIRECTX11_SUPPORT OFF CACHE BOOL "Enable directx11")
     set(IMGUI_DIRECTX12_SUPPORT OFF CACHE BOOL "Enable directx12")
 endif()
 
@@ -99,6 +100,19 @@ if(IMGUI_VULKAN_SUPPORT)
     list(APPEND IMGUI_COMPONENTS vulkan)
 endif()
 
+if(IMGUI_DIRECTX11_SUPPORT AND WIN32)
+    add_component(
+        COMPONENT_NAME  directx11
+        STATIC
+        NAMESPACE       imgui
+        OUTPUT_NAME     imgui_directx11
+    	SOURCE_FILES	${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
+    )
+    component_add_internal_dependencies(directx11 core)
+    list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx11.h)
+    list(APPEND IMGUI_COMPONENTS directx11)
+endif()
+
 if(IMGUI_DIRECTX12_SUPPORT AND WIN32)
     add_component(
         COMPONENT_NAME  directx12
@@ -110,6 +124,15 @@ if(IMGUI_DIRECTX12_SUPPORT AND WIN32)
     component_add_internal_dependencies(directx12 core)
     list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_dx12.h)
     list(APPEND IMGUI_COMPONENTS directx12)
+endif()
+
+if(IMGUI_DIRECTX12_SUPPORT OR IMGUI_DIRECTX11_SUPPORT)
+    target_sources(
+        core
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    )
+    list(APPEND IMGUI_BACKENDS_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/backends/imgui_impl_win32.h)
 endif()
 
 install_components(
