@@ -23,6 +23,7 @@ set(IMGUI_CORE_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/imgui_tables.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/imgui_widgets.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/imgui.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
 )
 
 set(IMGUI_HEADERS
@@ -32,6 +33,7 @@ set(IMGUI_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/imstb_rectpack.h
     ${CMAKE_CURRENT_SOURCE_DIR}/imstb_textedit.h
     ${CMAKE_CURRENT_SOURCE_DIR}/imstb_truetype.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/misc/cpp/imgui_stdlib.h
 )
 
 add_component(
