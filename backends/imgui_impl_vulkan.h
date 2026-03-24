@@ -138,6 +138,48 @@ struct ImGui_ImplVulkan_RenderState
 };
 
 //-------------------------------------------------------------------------
+// Threaded Rendering Extensions (Ex API)
+//-------------------------------------------------------------------------
+// These functions allow the Vulkan renderer backend to be used from a dedicated
+// rendering thread WITHOUT touching the live ImGuiContext. The renderer state is
+// held in an explicit ImGui_ImplVulkan_Renderer object owned by the render thread.
+//
+// Typical usage:
+//   Game thread:   ImGui::NewFrame() -> UI calls -> ImGui::Render() -> snapshot ImDrawData
+//   Render thread: ImGui_ImplVulkan_RenderDrawDataEx(renderer, snapshot, cmd)
+//
+// The stock ImGui_ImplVulkan_XXX functions are NOT modified and continue to work
+// as before for single-threaded usage.
+
+// Opaque renderer handle (render-thread owned)
+struct ImGui_ImplVulkan_Renderer;
+
+// Texture resolver callback: resolves an ImTextureID to a VkDescriptorSet at render time.
+// When set, the render loop calls this instead of casting ImTextureID directly.
+typedef VkDescriptorSet (*ImGui_ImplVulkan_TexResolverFn)(ImGui_ImplVulkan_Renderer* renderer, ImTextureID tex_id, void* user_data);
+
+// Renderer lifecycle (call from render thread)
+IMGUI_IMPL_API ImGui_ImplVulkan_Renderer*   ImGui_ImplVulkan_CreateRendererEx(const ImGui_ImplVulkan_InitInfo* info);
+IMGUI_IMPL_API void                         ImGui_ImplVulkan_DestroyRendererEx(ImGui_ImplVulkan_Renderer* renderer);
+
+// Rendering (call from render thread — does NOT touch current ImGuiContext)
+IMGUI_IMPL_API void                         ImGui_ImplVulkan_RenderDrawDataEx(ImGui_ImplVulkan_Renderer* renderer, ImDrawData* draw_data, VkCommandBuffer command_buffer, VkPipeline pipeline = VK_NULL_HANDLE);
+
+// Texture management (call from render thread)
+IMGUI_IMPL_API VkDescriptorSet              ImGui_ImplVulkan_AddTextureEx(ImGui_ImplVulkan_Renderer* renderer, VkSampler sampler, VkImageView image_view, VkImageLayout image_layout);
+IMGUI_IMPL_API void                         ImGui_ImplVulkan_RemoveTextureEx(ImGui_ImplVulkan_Renderer* renderer, VkDescriptorSet descriptor_set);
+
+// Texture resolver (optional, call from render thread before rendering)
+IMGUI_IMPL_API void                         ImGui_ImplVulkan_SetTextureResolverEx(ImGui_ImplVulkan_Renderer* renderer, ImGui_ImplVulkan_TexResolverFn resolver, void* user_data);
+
+// Font texture creation (call from render thread)
+IMGUI_IMPL_API bool                         ImGui_ImplVulkan_CreateFontsTextureEx(ImGui_ImplVulkan_Renderer* renderer, unsigned char* pixels, int width, int height);
+IMGUI_IMPL_API void                         ImGui_ImplVulkan_DestroyFontsTextureEx(ImGui_ImplVulkan_Renderer* renderer);
+
+// Get the font texture descriptor set (call from render thread, after CreateFontsTextureEx)
+IMGUI_IMPL_API VkDescriptorSet              ImGui_ImplVulkan_GetFontsTextureDescriptorSetEx(ImGui_ImplVulkan_Renderer* renderer);
+
+//-------------------------------------------------------------------------
 // Internal / Miscellaneous Vulkan Helpers
 //-------------------------------------------------------------------------
 // Used by example's main.cpp. Used by multi-viewport features. PROBABLY NOT used by your own engine/app.
