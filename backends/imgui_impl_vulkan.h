@@ -180,6 +180,62 @@ IMGUI_IMPL_API void                         ImGui_ImplVulkan_DestroyFontsTexture
 IMGUI_IMPL_API VkDescriptorSet              ImGui_ImplVulkan_GetFontsTextureDescriptorSetEx(ImGui_ImplVulkan_Renderer* renderer);
 
 //-------------------------------------------------------------------------
+// Multi-Viewport Lifecycle Extensions (Ex API)
+//-------------------------------------------------------------------------
+// These functions decouple viewport Vulkan resource management from the game
+// thread.  Game-thread callbacks (CreateWindow/DestroyWindow/SetWindowSize)
+// become lightweight stubs that collect events into the backend data.  The
+// engine drains those events (via DrainViewportEventsEx) and the render thread
+// executes heavy Vulkan operations.
+
+struct ImGui_ImplVulkan_ViewportEvent
+{
+    enum Type : unsigned char { Created, Destroyed, Resized };
+    Type                type;
+    ImGuiID             viewport_id;
+    void*               viewport_data;      // ViewportData* — Created: freshly allocated; Destroyed: detached; Resized: borrowed
+    VkSurfaceKHR        surface;            // Created only
+    VkSurfaceFormatKHR  surface_format;     // Created only
+    VkPresentModeKHR    present_mode;       // Created only
+    int                 width;              // Created/Resized
+    int                 height;             // Created/Resized
+};
+
+// Game thread: drain collected viewport events since the last call (clears the internal buffer).
+// Returns pointer to contiguous array; *out_count receives the element count.
+// The returned pointer is valid until the next call to DrainViewportEventsEx.
+IMGUI_IMPL_API const ImGui_ImplVulkan_ViewportEvent* ImGui_ImplVulkan_DrainViewportEventsEx(int* out_count);
+
+// Render thread: apply pending viewport resource creation/resize.
+// Call BEFORE RenderPlatformWindowsDefault().
+IMGUI_IMPL_API void ImGui_ImplVulkan_SyncViewportResourcesEx(ImGui_ImplVulkan_Renderer* renderer);
+
+// Render thread: apply viewport lifecycle events purely from an event array.
+// Unlike SyncViewportResourcesEx, this does NOT access platform_io.Viewports at all.
+IMGUI_IMPL_API void ImGui_ImplVulkan_SyncViewportResourcesFromEventsEx(
+    ImGui_ImplVulkan_Renderer* renderer,
+    const ImGui_ImplVulkan_ViewportEvent* events, int event_count);
+
+// Render thread: render a secondary viewport using explicit data (no ImGuiViewport* access).
+// `vd` is the ImGui_ImplVulkan_ViewportData* from a ViewportFrameEntry.
+IMGUI_IMPL_API void ImGui_ImplVulkan_RenderViewportEx(
+    ImGui_ImplVulkan_Renderer* renderer,
+    void* viewport_data,
+    ImDrawData* draw_data,
+    ImVec2 size,
+    ImGuiViewportFlags flags);
+
+// Render thread: present a secondary viewport's swapchain.
+// `vd` is the ImGui_ImplVulkan_ViewportData* from a ViewportFrameEntry.
+IMGUI_IMPL_API void ImGui_ImplVulkan_SwapViewportEx(void* viewport_data);
+
+// Render thread: destroy a viewport's Vulkan resources (swapchain, render buffers, etc.)
+// and free the ViewportData.  The caller owns the VkSurfaceKHR lifetime.
+// `viewport_data` is the pointer received from a ViewportEvent::Destroyed event.
+IMGUI_IMPL_API void ImGui_ImplVulkan_DestroyViewportResourcesEx(
+    ImGui_ImplVulkan_Renderer* renderer, void* viewport_data);
+
+//-------------------------------------------------------------------------
 // Internal / Miscellaneous Vulkan Helpers
 //-------------------------------------------------------------------------
 // Used by example's main.cpp. Used by multi-viewport features. PROBABLY NOT used by your own engine/app.
