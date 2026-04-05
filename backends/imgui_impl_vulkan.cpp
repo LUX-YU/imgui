@@ -2429,15 +2429,15 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
     VkSwapchainKHR old_swapchain = wd->Swapchain;
     wd->Swapchain = VK_NULL_HANDLE;
 
-    // Wait only on this viewport's in-flight fences instead of vkDeviceWaitIdle
-    // so that the game thread never touches VkQueue host-synchronization state.
-    for (uint32_t i = 0; i < wd->ImageCount; i++)
+    // Wait for ALL device operations (including vkQueuePresentKHR) to complete.
+    // Per-fence waits are insufficient: fences only cover vkQueueSubmit, but
+    // vkQueuePresentKHR also holds a reference to RenderCompleteSemaphore and
+    // has no associated fence.  Destroying semaphores while a present is still
+    // in-flight triggers VUID-vkDestroySemaphore-semaphore-05149.
+    if (wd->ImageCount > 0)
     {
-        if (wd->Frames[i].Fence != VK_NULL_HANDLE)
-        {
-            err = vkWaitForFences(device, 1, &wd->Frames[i].Fence, VK_TRUE, UINT64_MAX);
-            check_vk_result(err);
-        }
+        err = vkDeviceWaitIdle(device);
+        check_vk_result(err);
     }
 
     // We don't use ImGui_ImplVulkanH_DestroyWindow() because we want to preserve the old swapchain to create the new one.
@@ -2489,6 +2489,16 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
         {
             info.imageExtent.width = wd->Width = cap.currentExtent.width;
             info.imageExtent.height = wd->Height = cap.currentExtent.height;
+        }
+        // Guard against zero-extent (minimized or transient zero-size during resize).
+        // vkCreateSwapchainKHR requires imageExtent within [minImageExtent, maxImageExtent],
+        // which is always >= {1,1}.  Skip creation; RenderViewportEx will set
+        // SwapChainNeedRebuild and retry once the window has a valid size.
+        if (info.imageExtent.width == 0 || info.imageExtent.height == 0)
+        {
+            if (old_swapchain)
+                vkDestroySwapchainKHR(device, old_swapchain, allocator);
+            return;
         }
         err = vkCreateSwapchainKHR(device, &info, allocator, &wd->Swapchain);
         check_vk_result(err);
@@ -2608,15 +2618,12 @@ void ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevic
 
 void ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator)
 {
-    // Wait only on this viewport's in-flight fences instead of vkDeviceWaitIdle
-    // so that the game thread never touches VkQueue host-synchronization state.
-    for (uint32_t i = 0; i < wd->ImageCount; i++)
+    // Wait for ALL device operations (including vkQueuePresentKHR) to complete
+    // before destroying semaphores.  See CreateWindowSwapChain for rationale.
+    if (wd->ImageCount > 0)
     {
-        if (wd->Frames[i].Fence != VK_NULL_HANDLE)
-        {
-            VkResult err = vkWaitForFences(device, 1, &wd->Frames[i].Fence, VK_TRUE, UINT64_MAX);
-            (void)err; // Best-effort during teardown
-        }
+        VkResult err = vkDeviceWaitIdle(device);
+        (void)err; // Best-effort during teardown
     }
 
     for (uint32_t i = 0; i < wd->ImageCount; i++)
@@ -3202,6 +3209,13 @@ void ImGui_ImplVulkan_RenderViewportEx(
     }
 
     ImGui_ImplVulkanH_Frame* fd = nullptr;
+    // Swapchain may be null if creation was skipped due to zero-extent (minimized window).
+    // Mark for rebuild so the next frame with a valid size will recreate it.
+    if (wd->Swapchain == VK_NULL_HANDLE)
+    {
+        vd->SwapChainNeedRebuild = true;
+        return;
+    }
     ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
     {
         {
