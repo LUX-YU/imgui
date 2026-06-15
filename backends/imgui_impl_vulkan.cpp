@@ -2482,18 +2482,33 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
             info.minImageCount = cap.maxImageCount;
         if (cap.currentExtent.width == 0xffffffff)
         {
-            info.imageExtent.width = wd->Width = w;
-            info.imageExtent.height = wd->Height = h;
+            info.imageExtent.width = w;
+            info.imageExtent.height = h;
         }
         else
         {
-            info.imageExtent.width = wd->Width = cap.currentExtent.width;
-            info.imageExtent.height = wd->Height = cap.currentExtent.height;
+            info.imageExtent.width = cap.currentExtent.width;
+            info.imageExtent.height = cap.currentExtent.height;
         }
-        // Guard against zero-extent (minimized or transient zero-size during resize).
-        // vkCreateSwapchainKHR requires imageExtent within [minImageExtent, maxImageExtent],
-        // which is always >= {1,1}.  Skip creation; RenderViewportEx will set
-        // SwapChainNeedRebuild and retry once the window has a valid size.
+        // Clamp the requested extent into the surface's allowed range.  The
+        // multi-threaded viewport bridge can hand us a stale/torn size: a
+        // platform window may churn (create/minimize) while a modal native file
+        // dialog blocks the UI thread, so a Created event can capture
+        // viewport->Size before it is set, yielding an absurd extent such as
+        // (1, 1398498816).  vkCreateSwapchainKHR requires imageExtent within
+        // [minImageExtent, maxImageExtent]; an out-of-bounds extent is a
+        // validation error and hard-crashes some drivers.  Clamping against the
+        // caps we just queried makes a bad size non-fatal — the frame's real
+        // size (carried separately) triggers a rebuild on the next tick.
+        if (info.imageExtent.width  < cap.minImageExtent.width)  info.imageExtent.width  = cap.minImageExtent.width;
+        if (info.imageExtent.width  > cap.maxImageExtent.width)  info.imageExtent.width  = cap.maxImageExtent.width;
+        if (info.imageExtent.height < cap.minImageExtent.height) info.imageExtent.height = cap.minImageExtent.height;
+        if (info.imageExtent.height > cap.maxImageExtent.height) info.imageExtent.height = cap.maxImageExtent.height;
+        wd->Width  = (int)info.imageExtent.width;
+        wd->Height = (int)info.imageExtent.height;
+        // Skip creation when the surface cannot host a swapchain (minimized →
+        // maxImageExtent (0,0) clamps the extent to zero).  RenderViewportEx
+        // leaves SwapChainNeedRebuild set and retries once the size is valid.
         if (info.imageExtent.width == 0 || info.imageExtent.height == 0)
         {
             if (old_swapchain)
