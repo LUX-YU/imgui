@@ -148,3 +148,16 @@ install(
     FILES       ${IMGUI_HEADERS} ${IMGUI_BACKENDS_HEADERS}
     DESTINATION ${CMAKE_INSTALL_PREFIX}/include
 )
+
+# ── Packaging (CPack → .deb). LUX fork of Dear ImGui (CMake build + multithreaded
+# UI). Consumers link the glfw3/vulkan backends, so the -dev packages are declared.
+lux_configure_packaging(
+    NAME     imgui
+    VERSION  0.0.0
+    SUMMARY  "Dear ImGui (LUX fork: CMake build + multithreaded UI)"
+    VENDOR   "LUX-YU"
+    CONTACT  "LUX-YU <chenhui.lux.yu@outlook.com>"
+    HOMEPAGE "https://github.com/LUX-YU/imgui"
+    DEB_DEPENDS  "lux-cmake-toolset (>= 0.5.0)" "libglfw3-dev" "libvulkan-dev"
+    RPM_REQUIRES "lux-cmake-toolset >= 0.5.0" "glfw-devel" "vulkan-loader-devel"
+)
