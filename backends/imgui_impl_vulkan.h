@@ -165,6 +165,16 @@ IMGUI_IMPL_API void                         ImGui_ImplVulkan_DestroyRendererEx(I
 // Rendering (call from render thread — does NOT touch current ImGuiContext)
 IMGUI_IMPL_API void                         ImGui_ImplVulkan_RenderDrawDataEx(ImGui_ImplVulkan_Renderer* renderer, ImDrawData* draw_data, VkCommandBuffer command_buffer, VkPipeline pipeline = VK_NULL_HANDLE);
 
+// Per-target vertex/index ring (RT 一等化 M4c):同一个 renderer 在一帧内
+// 渲往多个 target(主窗叠加 + 各副视口)时,每个 target 持自己的环,
+// 消掉 RenderViewportEx 里的 RenderBuffers swap 技巧。句柄不透明;
+// Destroy 前调用方保证 GPU 已不再读该环(fence 水位 / waitIdle)。
+IMGUI_IMPL_API void*                        ImGui_ImplVulkan_CreateRenderBuffersEx(ImGui_ImplVulkan_Renderer* renderer);
+IMGUI_IMPL_API void                         ImGui_ImplVulkan_DestroyRenderBuffersEx(ImGui_ImplVulkan_Renderer* renderer, void* render_buffers);
+// 带显式顶点环的绘制:render_buffers = CreateRenderBuffersEx 的句柄
+// (nullptr 回退 renderer 自持环,等价旧签名)。
+IMGUI_IMPL_API void                         ImGui_ImplVulkan_RenderDrawDataWithBuffersEx(ImGui_ImplVulkan_Renderer* renderer, ImDrawData* draw_data, VkCommandBuffer command_buffer, void* render_buffers, VkPipeline pipeline = VK_NULL_HANDLE);
+
 // Texture management (call from render thread)
 IMGUI_IMPL_API VkDescriptorSet              ImGui_ImplVulkan_AddTextureEx(ImGui_ImplVulkan_Renderer* renderer, VkSampler sampler, VkImageView image_view, VkImageLayout image_layout);
 IMGUI_IMPL_API void                         ImGui_ImplVulkan_RemoveTextureEx(ImGui_ImplVulkan_Renderer* renderer, VkDescriptorSet descriptor_set);
@@ -190,7 +200,13 @@ IMGUI_IMPL_API VkDescriptorSet              ImGui_ImplVulkan_GetFontsTextureDesc
 
 struct ImGui_ImplVulkan_ViewportEvent
 {
-    enum Type : unsigned char { Created, Destroyed, Resized };
+    // ResizeBegin/ResizeEnd bracket a burst of size changes (drag-resize or
+    // dock resolution). The engine suppresses swapchain rebuilds between them
+    // and rebuilds ONCE at ResizeEnd against the now-stable window size —
+    // closing the caps-query↔create TOCTOU race that fires VUID-07781 while a
+    // viewport window is mid-resize. Sourced from ImGui's own per-frame size-
+    // change detection (see ImGui_ImplVulkan_DrainViewportEventsEx).
+    enum Type : unsigned char { Created, Destroyed, Resized, ResizeBegin, ResizeEnd };
     Type                type;
     ImGuiID             viewport_id;
     void*               viewport_data;      // ViewportData* — Created: freshly allocated; Destroyed: detached; Resized: borrowed
@@ -206,28 +222,11 @@ struct ImGui_ImplVulkan_ViewportEvent
 // The returned pointer is valid until the next call to DrainViewportEventsEx.
 IMGUI_IMPL_API const ImGui_ImplVulkan_ViewportEvent* ImGui_ImplVulkan_DrainViewportEventsEx(int* out_count);
 
-// Render thread: apply pending viewport resource creation/resize.
-// Call BEFORE RenderPlatformWindowsDefault().
-IMGUI_IMPL_API void ImGui_ImplVulkan_SyncViewportResourcesEx(ImGui_ImplVulkan_Renderer* renderer);
-
-// Render thread: apply viewport lifecycle events purely from an event array.
-// Unlike SyncViewportResourcesEx, this does NOT access platform_io.Viewports at all.
-IMGUI_IMPL_API void ImGui_ImplVulkan_SyncViewportResourcesFromEventsEx(
-    ImGui_ImplVulkan_Renderer* renderer,
-    const ImGui_ImplVulkan_ViewportEvent* events, int event_count);
-
-// Render thread: render a secondary viewport using explicit data (no ImGuiViewport* access).
-// `vd` is the ImGui_ImplVulkan_ViewportData* from a ViewportFrameEntry.
-IMGUI_IMPL_API void ImGui_ImplVulkan_RenderViewportEx(
-    ImGui_ImplVulkan_Renderer* renderer,
-    void* viewport_data,
-    ImDrawData* draw_data,
-    ImVec2 size,
-    ImGuiViewportFlags flags);
-
-// Render thread: present a secondary viewport's swapchain.
-// `vd` is the ImGui_ImplVulkan_ViewportData* from a ViewportFrameEntry.
-IMGUI_IMPL_API void ImGui_ImplVulkan_SwapViewportEx(void* viewport_data);
+// (Removed in RT 一等化 M4: the engine owns secondary-viewport swapchains via
+//  PresentContext and renders them into the primary command buffer, so the fork's
+//  own parallel render/present/sync-resources path is gone. Deleted:
+//  SyncViewportResourcesEx / SyncViewportResourcesFromEventsEx / RenderViewportEx /
+//  SwapViewportEx. The engine consumes ViewportEvents + ViewportFrameEntry directly.)
 
 // Render thread: destroy a viewport's Vulkan resources (swapchain, render buffers, etc.)
 // and free the ViewportData.  The caller owns the VkSurfaceKHR lifetime.

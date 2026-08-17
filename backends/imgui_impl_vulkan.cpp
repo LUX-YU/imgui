@@ -252,8 +252,10 @@ struct ImGui_ImplVulkan_ViewportData
     bool                                    SwapChainSuboptimal;    // Flag when VK_SUBOPTIMAL_KHR was returned.
     bool                                    PendingInit;            // Render thread hasn't created swapchain/pipeline yet
     bool                                    PendingResize;          // Render thread hasn't rebuilt swapchain yet
+    bool                                    ExtResizing;            // Ex path: inside a ResizeBegin..ResizeEnd bracket
+    int                                     ExtLastResizeFrame;     // Ex path: ImGui frame of the last size change
 
-    ImGui_ImplVulkan_ViewportData() { WindowOwned = SwapChainNeedRebuild = SwapChainSuboptimal = PendingInit = PendingResize = false; memset(&RenderBuffers, 0, sizeof(RenderBuffers)); }
+    ImGui_ImplVulkan_ViewportData() { WindowOwned = SwapChainNeedRebuild = SwapChainSuboptimal = PendingInit = PendingResize = ExtResizing = false; ExtLastResizeFrame = -1; memset(&RenderBuffers, 0, sizeof(RenderBuffers)); }
     ~ImGui_ImplVulkan_ViewportData() { }
 };
 
@@ -651,6 +653,12 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
 
                 // Bind DescriptorSet with font or user texture
                 VkDescriptorSet desc_set = (VkDescriptorSet)pcmd->GetTexID();
+                // Null texture (e.g. a stale/dead deferred handle) — binding it is a
+                // Vulkan validation error (VUID-vkCmdBindDescriptorSets-pDescriptorSets-06563)
+                // and the draw would sample garbage anyway. Skip the draw: the image
+                // simply doesn't appear for this frame.
+                if (desc_set == VK_NULL_HANDLE)
+                    continue;
                 vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bd->PipelineLayout, 0, 1, &desc_set, 0, nullptr);
 
                 // Draw
@@ -1826,6 +1834,45 @@ void ImGui_ImplVulkan_DestroyRendererEx(ImGui_ImplVulkan_Renderer* renderer)
     IM_DELETE(renderer);
 }
 
+// Per-target vertex/index ring(RT 一等化 M4c)——见头文件说明。
+void* ImGui_ImplVulkan_CreateRenderBuffersEx(ImGui_ImplVulkan_Renderer* renderer)
+{
+    IM_UNUSED(renderer);
+    ImGui_ImplVulkan_WindowRenderBuffers* wrb = IM_NEW(ImGui_ImplVulkan_WindowRenderBuffers)();
+    memset((void*)wrb, 0, sizeof(*wrb));
+    return wrb;
+}
+
+void ImGui_ImplVulkan_DestroyRenderBuffersEx(ImGui_ImplVulkan_Renderer* renderer, void* render_buffers)
+{
+    if (render_buffers == nullptr)
+        return;
+    ImGui_ImplVulkan_WindowRenderBuffers* wrb = (ImGui_ImplVulkan_WindowRenderBuffers*)render_buffers;
+    if (renderer != nullptr && renderer->Bd != nullptr)
+    {
+        ImGui_ImplVulkan_InitInfo* v = &renderer->Bd->VulkanInitInfo;
+        ImGui_ImplVulkan_DestroyWindowRenderBuffers(v->Device, wrb, v->Allocator);
+    }
+    IM_DELETE(wrb);
+}
+
+void ImGui_ImplVulkan_RenderDrawDataWithBuffersEx(ImGui_ImplVulkan_Renderer* renderer, ImDrawData* draw_data, VkCommandBuffer command_buffer, void* render_buffers, VkPipeline pipeline)
+{
+    if (render_buffers == nullptr)
+    {
+        ImGui_ImplVulkan_RenderDrawDataEx(renderer, draw_data, command_buffer, pipeline);
+        return;
+    }
+    // 内化原 RenderViewportEx 的 swap 技巧:环随 target 走,renderer 自持
+    // 环只属于主窗叠加。
+    ImGui_ImplVulkan_WindowRenderBuffers* wrb = (ImGui_ImplVulkan_WindowRenderBuffers*)render_buffers;
+    ImGui_ImplVulkan_WindowRenderBuffers saved = renderer->RenderBuffers;
+    renderer->RenderBuffers = *wrb;
+    ImGui_ImplVulkan_RenderDrawDataEx(renderer, draw_data, command_buffer, pipeline);
+    *wrb = renderer->RenderBuffers;
+    renderer->RenderBuffers = saved;
+}
+
 void ImGui_ImplVulkan_RenderDrawDataEx(ImGui_ImplVulkan_Renderer* renderer, ImDrawData* draw_data, VkCommandBuffer command_buffer, VkPipeline pipeline)
 {
     // Avoid rendering when draw_data is null (can happen when the game thread's
@@ -1947,6 +1994,14 @@ void ImGui_ImplVulkan_RenderDrawDataEx(ImGui_ImplVulkan_Renderer* renderer, ImDr
                     desc_set = renderer->TexResolver(renderer, pcmd->GetTexID(), renderer->TexResolverUserData);
                 else
                     desc_set = (VkDescriptorSet)pcmd->GetTexID();
+                // The resolver returns VK_NULL_HANDLE for a dead deferred sentinel
+                // (texture/render-target destroyed after this draw data was recorded
+                // — the replay snapshot runs one frame behind the main thread).
+                // Binding null is a validation error; skipping the draw is the
+                // designed degradation: the image blinks out for one frame and the
+                // next snapshot carries the re-resolved handle.
+                if (desc_set == VK_NULL_HANDLE)
+                    continue;
                 vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bd->PipelineLayout, 0, 1, &desc_set, 0, nullptr);
 
                 // Draw
@@ -2458,9 +2513,24 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
 
     // Create Swapchain
     {
-        VkSurfaceCapabilitiesKHR cap;
+        // Zero-init + hard-fail the caps query.  The platform window can be
+        // destroyed by the UI thread between RenderViewportEx's surface probe
+        // and this query (TOCTOU): a failing query (e.g. SURFACE_LOST) used to
+        // leave `cap` as UNINITIALISED STACK MEMORY while check_vk_result only
+        // reports — the garbage then poisons BOTH clamps below
+        // (cap.minImageCount forces minImageCount up to a pointer-like value,
+        // a garbage maxImageExtent lets a torn width through) and the poisoned
+        // create-info intermittently hard-crashes the driver.  Bail out
+        // instead: the caller sees Swapchain == VK_NULL_HANDLE and retries
+        // next frame; a truly lost surface ends with a Destroyed event.
+        VkSurfaceCapabilitiesKHR cap = {};
         err = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, wd->Surface, &cap);
-        check_vk_result(err);
+        if (err != VK_SUCCESS)
+        {
+            if (old_swapchain)
+                vkDestroySwapchainKHR(device, old_swapchain, allocator);
+            return;
+        }
 
         VkSwapchainCreateInfoKHR info = {};
         info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -2746,6 +2816,12 @@ static void ImGui_ImplVulkan_CreateWindow(ImGuiViewport* viewport)
         evt.width = (int)viewport->Size.x;
         evt.height = (int)viewport->Size.y;
         bd->PendingViewportEvents.push_back(evt);
+
+        // Ex path: ownership of the surface (and every WSI derivative) transfers
+        // to the event consumer — the engine adopts the surface and builds its own
+        // swapchain/semaphores. Clearing WindowOwned makes DestroyViewportResourcesEx
+        // a pure CPU-side cleanup (render buffers + vd), never a surface destroy.
+        vd->WindowOwned = false;
     }
     else
     {
@@ -2818,6 +2894,21 @@ static void ImGui_ImplVulkan_SetWindowSize(ImGuiViewport* viewport, ImVec2 size)
     {
         // Ex path: mark pending and collect event — render thread rebuilds swapchain
         vd->PendingResize = true;
+
+        // Open a resize bracket on the first size change of a burst. ResizeEnd
+        // is emitted from DrainViewportEventsEx once a frame passes with no
+        // further change (ImGui calls this only when the size actually changes).
+        if (!vd->ExtResizing)
+        {
+            vd->ExtResizing = true;
+            ImGui_ImplVulkan_ViewportEvent begin_evt = {};
+            begin_evt.type = ImGui_ImplVulkan_ViewportEvent::ResizeBegin;
+            begin_evt.viewport_id = viewport->ID;
+            begin_evt.viewport_data = vd;
+            bd->PendingViewportEvents.push_back(begin_evt);
+        }
+        vd->ExtLastResizeFrame = ImGui::GetFrameCount();
+
         ImGui_ImplVulkan_ViewportEvent evt = {};
         evt.type = ImGui_ImplVulkan_ViewportEvent::Resized;
         evt.viewport_id = viewport->ID;
@@ -2835,212 +2926,6 @@ static void ImGui_ImplVulkan_SetWindowSize(ImGuiViewport* viewport, ImVec2 size)
     }
 }
 
-static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
-{
-    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
-    ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport->RendererUserData;
-    if (vd == nullptr)
-        return;
-    if (vd->PendingInit)
-        return; // Swapchain not yet created by render thread — skip this frame
-    ImGui_ImplVulkanH_Window* wd = &vd->Window;
-    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
-    VkResult err;
-
-    if (vd->SwapChainNeedRebuild || vd->SwapChainSuboptimal)
-    {
-        ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount);
-        vd->SwapChainNeedRebuild = vd->SwapChainSuboptimal = false;
-    }
-
-    ImGui_ImplVulkanH_Frame* fd = nullptr;
-    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
-    {
-        {
-            err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, UINT64_MAX, fsd->ImageAcquiredSemaphore, VK_NULL_HANDLE, &wd->FrameIndex);
-            if (err == VK_ERROR_OUT_OF_DATE_KHR)
-            {
-                vd->SwapChainNeedRebuild = true; // Since we are not going to swap this frame anyway, it's ok that recreation happens on next frame.
-                return;
-            }
-            if (err == VK_SUBOPTIMAL_KHR)
-                vd->SwapChainSuboptimal = true;
-            else
-                check_vk_result(err);
-            fd = &wd->Frames[wd->FrameIndex];
-        }
-        for (;;)
-        {
-            err = vkWaitForFences(v->Device, 1, &fd->Fence, VK_TRUE, 100);
-            if (err == VK_SUCCESS) break;
-            if (err == VK_TIMEOUT) continue;
-            check_vk_result(err);
-        }
-        {
-            err = vkResetCommandPool(v->Device, fd->CommandPool, 0);
-            check_vk_result(err);
-            VkCommandBufferBeginInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            err = vkBeginCommandBuffer(fd->CommandBuffer, &info);
-            check_vk_result(err);
-        }
-        {
-            ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
-            memcpy(&wd->ClearValue.color.float32[0], &clear_color, 4 * sizeof(float));
-        }
-#ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-        if (v->UseDynamicRendering)
-        {
-            // Transition swapchain image to a layout suitable for drawing.
-            VkImageMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            barrier.image = fd->Backbuffer;
-            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.layerCount = 1;
-            vkCmdPipelineBarrier(fd->CommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-            VkRenderingAttachmentInfo attachmentInfo = {};
-            attachmentInfo.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
-            attachmentInfo.imageView = fd->BackbufferView;
-            attachmentInfo.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            attachmentInfo.resolveMode = VK_RESOLVE_MODE_NONE;
-            attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            attachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            attachmentInfo.clearValue = wd->ClearValue;
-
-            VkRenderingInfo renderingInfo = {};
-            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
-            renderingInfo.renderArea.extent.width = wd->Width;
-            renderingInfo.renderArea.extent.height = wd->Height;
-            renderingInfo.layerCount = 1;
-            renderingInfo.viewMask = 0;
-            renderingInfo.colorAttachmentCount = 1;
-            renderingInfo.pColorAttachments = &attachmentInfo;
-
-            ImGuiImplVulkanFuncs_vkCmdBeginRenderingKHR(fd->CommandBuffer, &renderingInfo);
-        }
-        else
-#endif
-        {
-            VkRenderPassBeginInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            info.renderPass = wd->RenderPass;
-            info.framebuffer = fd->Framebuffer;
-            info.renderArea.extent.width = wd->Width;
-            info.renderArea.extent.height = wd->Height;
-            info.clearValueCount = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? 0 : 1;
-            info.pClearValues = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? nullptr : &wd->ClearValue;
-            vkCmdBeginRenderPass(fd->CommandBuffer, &info, VK_SUBPASS_CONTENTS_INLINE);
-        }
-    }
-
-    // Use RenderDrawDataEx with texture resolver when Ex renderer is active,
-    // otherwise fall back to the stock non-Ex path.
-    // Guard: DrawData may be null or stale if the game thread's NewFrame() races ahead.
-    if (viewport->DrawData != nullptr)
-    {
-        if (bd->RendererEx)
-        {
-            ImGui_ImplVulkan_WindowRenderBuffers saved_wrb = bd->RendererEx->RenderBuffers;
-            bd->RendererEx->RenderBuffers = vd->RenderBuffers;
-            ImGui_ImplVulkan_RenderDrawDataEx(bd->RendererEx, viewport->DrawData, fd->CommandBuffer, bd->PipelineForViewports);
-            vd->RenderBuffers = bd->RendererEx->RenderBuffers;
-            bd->RendererEx->RenderBuffers = saved_wrb;
-        }
-        else
-        {
-            ImGui_ImplVulkan_RenderDrawData(viewport->DrawData, fd->CommandBuffer, bd->PipelineForViewports);
-        }
-    }
-
-    {
-#ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-        if (v->UseDynamicRendering)
-        {
-            ImGuiImplVulkanFuncs_vkCmdEndRenderingKHR(fd->CommandBuffer);
-
-            // Transition image to a layout suitable for presentation
-            VkImageMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barrier.image = fd->Backbuffer;
-            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.layerCount = 1;
-            vkCmdPipelineBarrier(fd->CommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-        }
-        else
-#endif
-        {
-            vkCmdEndRenderPass(fd->CommandBuffer);
-        }
-        {
-            VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            VkSubmitInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            info.waitSemaphoreCount = 1;
-            info.pWaitSemaphores = &fsd->ImageAcquiredSemaphore;
-            info.pWaitDstStageMask = &wait_stage;
-            info.commandBufferCount = 1;
-            info.pCommandBuffers = &fd->CommandBuffer;
-            info.signalSemaphoreCount = 1;
-            info.pSignalSemaphores = &fsd->RenderCompleteSemaphore;
-
-            err = vkEndCommandBuffer(fd->CommandBuffer);
-            check_vk_result(err);
-            err = vkResetFences(v->Device, 1, &fd->Fence);
-            check_vk_result(err);
-            err = vkQueueSubmit(v->Queue, 1, &info, fd->Fence);
-            check_vk_result(err);
-        }
-    }
-}
-
-static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
-{
-    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
-    ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport->RendererUserData;
-    if (vd == nullptr)
-        return;
-    if (vd->PendingInit)
-        return; // Swapchain not yet created by render thread — skip this frame
-    ImGui_ImplVulkanH_Window* wd = &vd->Window;
-    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
-
-    if (vd->SwapChainNeedRebuild) // Frame data became invalid in the middle of rendering
-        return;
-
-    VkResult err;
-    uint32_t present_index = wd->FrameIndex;
-
-    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
-    VkPresentInfoKHR info = {};
-    info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    info.waitSemaphoreCount = 1;
-    info.pWaitSemaphores = &fsd->RenderCompleteSemaphore;
-    info.swapchainCount = 1;
-    info.pSwapchains = &wd->Swapchain;
-    info.pImageIndices = &present_index;
-    err = vkQueuePresentKHR(v->Queue, &info);
-    if (err == VK_ERROR_OUT_OF_DATE_KHR)
-    {
-        vd->SwapChainNeedRebuild = true;
-        return;
-    }
-    if (err == VK_SUBOPTIMAL_KHR)
-        vd->SwapChainSuboptimal = true;
-    else
-        check_vk_result(err);
-    wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->SemaphoreCount; // Now we can use the next set of semaphores
-}
-
 void ImGui_ImplVulkan_InitMultiViewportSupport()
 {
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
@@ -3049,8 +2934,10 @@ void ImGui_ImplVulkan_InitMultiViewportSupport()
     platform_io.Renderer_CreateWindow = ImGui_ImplVulkan_CreateWindow;
     platform_io.Renderer_DestroyWindow = ImGui_ImplVulkan_DestroyWindow;
     platform_io.Renderer_SetWindowSize = ImGui_ImplVulkan_SetWindowSize;
-    platform_io.Renderer_RenderWindow = ImGui_ImplVulkan_RenderWindow;
-    platform_io.Renderer_SwapBuffers = ImGui_ImplVulkan_SwapBuffers;
+    // RenderWindow / SwapBuffers intentionally NOT registered: the engine renders
+    // secondary viewports itself (into the primary CB via PresentContext), and
+    // never calls ImGui::RenderPlatformWindowsDefault(). The stock parallel
+    // render/present path was removed (RT 一等化 M4 fork 删除清单).
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3062,347 +2949,40 @@ const ImGui_ImplVulkan_ViewportEvent* ImGui_ImplVulkan_DrainViewportEventsEx(int
     IM_ASSERT(out_count != nullptr);
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
     IM_ASSERT(bd != nullptr);
+
+    // Settle detection (once per frame, UI thread, after UpdatePlatformWindows):
+    // a viewport that was resizing but received NO size change this frame has
+    // stopped churning → close its bracket with ResizeEnd. ImGui calls
+    // Renderer_SetWindowSize only on frames where the size changes, so the
+    // "stopped" frame has no callback of its own — we catch it here by comparing
+    // the last-change frame against the current frame.
+    const int frame = ImGui::GetFrameCount();
+    ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    for (int n = 1; n < platform_io.Viewports.Size; n++)
+    {
+        ImGuiViewport* viewport = platform_io.Viewports[n];
+        ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport->RendererUserData;
+        if (vd == nullptr || !vd->ExtResizing)
+            continue;
+        if (vd->ExtLastResizeFrame < frame)
+        {
+            ImGui_ImplVulkan_ViewportEvent end_evt = {};
+            end_evt.type = ImGui_ImplVulkan_ViewportEvent::ResizeEnd;
+            end_evt.viewport_id = viewport->ID;
+            end_evt.viewport_data = vd;
+            end_evt.width  = (int)viewport->Size.x;
+            end_evt.height = (int)viewport->Size.y;
+            bd->PendingViewportEvents.push_back(end_evt);
+            vd->ExtResizing = false;
+        }
+    }
+
     // Swap into a static drain buffer so the returned pointer remains valid until the next drain
     static ImVector<ImGui_ImplVulkan_ViewportEvent> s_drain_buffer;
     s_drain_buffer.resize(0);
     s_drain_buffer.swap(bd->PendingViewportEvents);
     *out_count = s_drain_buffer.Size;
     return s_drain_buffer.Data;
-}
-
-void ImGui_ImplVulkan_SyncViewportResourcesEx(ImGui_ImplVulkan_Renderer* renderer)
-{
-    IM_ASSERT(renderer != nullptr);
-    ImGui_ImplVulkan_Data* bd = renderer->Bd;
-    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
-
-    ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
-    for (int n = 1; n < platform_io.Viewports.Size; n++)
-    {
-        ImGuiViewport* viewport = platform_io.Viewports[n];
-        ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport->RendererUserData;
-        if (vd == nullptr)
-            continue;
-        ImGui_ImplVulkanH_Window* wd = &vd->Window;
-
-        if (vd->PendingInit)
-        {
-            // Create swapchain, render pass, framebuffers, command pool
-            ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount);
-            vd->PendingInit = false;
-
-            // Create pipeline for viewports (shared, created once)
-            if (bd->PipelineForViewports == VK_NULL_HANDLE)
-            {
-#ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-                if (v->UseDynamicRendering)
-                {
-                    VkFormat viewport_format = wd->SurfaceFormat.format;
-                    VkPipelineRenderingCreateInfoKHR viewport_prc = v->PipelineRenderingCreateInfo;
-                    viewport_prc.colorAttachmentCount = 1;
-                    viewport_prc.pColorAttachmentFormats = &viewport_format;
-
-                    VkPipelineRenderingCreateInfoKHR saved_prc = v->PipelineRenderingCreateInfo;
-                    v->PipelineRenderingCreateInfo = viewport_prc;
-                    ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_SAMPLE_COUNT_1_BIT, &bd->PipelineForViewports, 0);
-                    v->PipelineRenderingCreateInfo = saved_prc;
-                }
-                else
-#endif
-                {
-                    ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, VK_NULL_HANDLE, wd->RenderPass, VK_SAMPLE_COUNT_1_BIT, &bd->PipelineForViewports, 0);
-                }
-            }
-        }
-        else if (vd->PendingResize)
-        {
-            wd->ClearEnable = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? false : true;
-            ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount);
-            vd->PendingResize = false;
-        }
-    }
-}
-
-// Helper: ensure the shared viewport pipeline exists (called on first init).
-static void ImGui_ImplVulkan_EnsureViewportPipeline(ImGui_ImplVulkan_Data* bd, ImGui_ImplVulkanH_Window* wd)
-{
-    if (bd->PipelineForViewports != VK_NULL_HANDLE)
-        return;
-    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
-#ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-    if (v->UseDynamicRendering)
-    {
-        VkFormat viewport_format = wd->SurfaceFormat.format;
-        VkPipelineRenderingCreateInfoKHR viewport_prc = v->PipelineRenderingCreateInfo;
-        viewport_prc.colorAttachmentCount = 1;
-        viewport_prc.pColorAttachmentFormats = &viewport_format;
-
-        VkPipelineRenderingCreateInfoKHR saved_prc = v->PipelineRenderingCreateInfo;
-        v->PipelineRenderingCreateInfo = viewport_prc;
-        ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_SAMPLE_COUNT_1_BIT, &bd->PipelineForViewports, 0);
-        v->PipelineRenderingCreateInfo = saved_prc;
-    }
-    else
-#endif
-    {
-        ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, VK_NULL_HANDLE, wd->RenderPass, VK_SAMPLE_COUNT_1_BIT, &bd->PipelineForViewports, 0);
-    }
-}
-
-void ImGui_ImplVulkan_SyncViewportResourcesFromEventsEx(
-    ImGui_ImplVulkan_Renderer* renderer,
-    const ImGui_ImplVulkan_ViewportEvent* events, int event_count)
-{
-    IM_ASSERT(renderer != nullptr);
-    ImGui_ImplVulkan_Data* bd = renderer->Bd;
-    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
-
-    for (int i = 0; i < event_count; i++)
-    {
-        const ImGui_ImplVulkan_ViewportEvent& evt = events[i];
-        if (evt.type == ImGui_ImplVulkan_ViewportEvent::Destroyed)
-            continue; // Handled separately via FrameRetireScheduler
-
-        ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)evt.viewport_data;
-        if (!vd)
-            continue;
-        ImGui_ImplVulkanH_Window* wd = &vd->Window;
-
-        if (evt.type == ImGui_ImplVulkan_ViewportEvent::Created)
-        {
-            wd->Surface       = evt.surface;
-            wd->SurfaceFormat = evt.surface_format;
-            wd->PresentMode   = evt.present_mode;
-            ImGui_ImplVulkanH_CreateOrResizeWindow(
-                v->Instance, v->PhysicalDevice, v->Device,
-                wd, v->QueueFamily, v->Allocator,
-                evt.width, evt.height, v->MinImageCount);
-            vd->PendingInit = false;
-            ImGui_ImplVulkan_EnsureViewportPipeline(bd, wd);
-        }
-        else if (evt.type == ImGui_ImplVulkan_ViewportEvent::Resized)
-        {
-            ImGui_ImplVulkanH_CreateOrResizeWindow(
-                v->Instance, v->PhysicalDevice, v->Device,
-                wd, v->QueueFamily, v->Allocator,
-                evt.width, evt.height, v->MinImageCount);
-            vd->PendingResize = false;
-        }
-    }
-}
-
-void ImGui_ImplVulkan_RenderViewportEx(
-    ImGui_ImplVulkan_Renderer* renderer,
-    void* viewport_data,
-    ImDrawData* draw_data,
-    ImVec2 size,
-    ImGuiViewportFlags flags)
-{
-    IM_ASSERT(renderer != nullptr);
-    ImGui_ImplVulkan_Data* bd = renderer->Bd;
-    ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport_data;
-    if (vd == nullptr)
-        return;
-    if (vd->PendingInit)
-        return;
-    ImGui_ImplVulkanH_Window* wd = &vd->Window;
-    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
-    VkResult err;
-
-    if (vd->SwapChainNeedRebuild || vd->SwapChainSuboptimal)
-    {
-        // Probe surface before attempting to recreate swapchain.
-        // The underlying OS window may have been destroyed by the game thread
-        // (data-decoupled: game thread runs ahead of render thread).
-        VkSurfaceCapabilitiesKHR probe_cap;
-        VkResult probe = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
-            v->PhysicalDevice, wd->Surface, &probe_cap);
-        if (probe == VK_ERROR_SURFACE_LOST_KHR)
-            return; // Surface lost; viewport will be removed from future snapshots.
-        ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)size.x, (int)size.y, v->MinImageCount);
-        vd->SwapChainNeedRebuild = vd->SwapChainSuboptimal = false;
-    }
-
-    ImGui_ImplVulkanH_Frame* fd = nullptr;
-    // Swapchain may be null if creation was skipped due to zero-extent (minimized window).
-    // Mark for rebuild so the next frame with a valid size will recreate it.
-    if (wd->Swapchain == VK_NULL_HANDLE)
-    {
-        vd->SwapChainNeedRebuild = true;
-        return;
-    }
-    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
-    {
-        {
-            err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, UINT64_MAX, fsd->ImageAcquiredSemaphore, VK_NULL_HANDLE, &wd->FrameIndex);
-            if (err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_ERROR_SURFACE_LOST_KHR)
-            {
-                vd->SwapChainNeedRebuild = true;
-                return;
-            }
-            if (err == VK_SUBOPTIMAL_KHR)
-                vd->SwapChainSuboptimal = true;
-            else
-                check_vk_result(err);
-            fd = &wd->Frames[wd->FrameIndex];
-        }
-        for (;;)
-        {
-            err = vkWaitForFences(v->Device, 1, &fd->Fence, VK_TRUE, 100);
-            if (err == VK_SUCCESS) break;
-            if (err == VK_TIMEOUT) continue;
-            check_vk_result(err);
-        }
-        {
-            err = vkResetCommandPool(v->Device, fd->CommandPool, 0);
-            check_vk_result(err);
-            VkCommandBufferBeginInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            err = vkBeginCommandBuffer(fd->CommandBuffer, &info);
-            check_vk_result(err);
-        }
-        {
-            ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
-            memcpy(&wd->ClearValue.color.float32[0], &clear_color, 4 * sizeof(float));
-        }
-#ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-        if (v->UseDynamicRendering)
-        {
-            VkImageMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            barrier.image = fd->Backbuffer;
-            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.layerCount = 1;
-            vkCmdPipelineBarrier(fd->CommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-            VkRenderingAttachmentInfo attachmentInfo = {};
-            attachmentInfo.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
-            attachmentInfo.imageView = fd->BackbufferView;
-            attachmentInfo.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            attachmentInfo.resolveMode = VK_RESOLVE_MODE_NONE;
-            attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            attachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            attachmentInfo.clearValue = wd->ClearValue;
-
-            VkRenderingInfo renderingInfo = {};
-            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
-            renderingInfo.renderArea.extent.width = wd->Width;
-            renderingInfo.renderArea.extent.height = wd->Height;
-            renderingInfo.layerCount = 1;
-            renderingInfo.viewMask = 0;
-            renderingInfo.colorAttachmentCount = 1;
-            renderingInfo.pColorAttachments = &attachmentInfo;
-
-            ImGuiImplVulkanFuncs_vkCmdBeginRenderingKHR(fd->CommandBuffer, &renderingInfo);
-        }
-        else
-#endif
-        {
-            VkRenderPassBeginInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            info.renderPass = wd->RenderPass;
-            info.framebuffer = fd->Framebuffer;
-            info.renderArea.extent.width = wd->Width;
-            info.renderArea.extent.height = wd->Height;
-            info.clearValueCount = (flags & ImGuiViewportFlags_NoRendererClear) ? 0 : 1;
-            info.pClearValues = (flags & ImGuiViewportFlags_NoRendererClear) ? nullptr : &wd->ClearValue;
-            vkCmdBeginRenderPass(fd->CommandBuffer, &info, VK_SUBPASS_CONTENTS_INLINE);
-        }
-    }
-
-    if (draw_data != nullptr && draw_data->Valid)
-    {
-        ImGui_ImplVulkan_WindowRenderBuffers saved_wrb = renderer->RenderBuffers;
-        renderer->RenderBuffers = vd->RenderBuffers;
-        ImGui_ImplVulkan_RenderDrawDataEx(renderer, draw_data, fd->CommandBuffer, bd->PipelineForViewports);
-        vd->RenderBuffers = renderer->RenderBuffers;
-        renderer->RenderBuffers = saved_wrb;
-    }
-
-    {
-#ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-        if (v->UseDynamicRendering)
-        {
-            ImGuiImplVulkanFuncs_vkCmdEndRenderingKHR(fd->CommandBuffer);
-
-            VkImageMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barrier.image = fd->Backbuffer;
-            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.layerCount = 1;
-            vkCmdPipelineBarrier(fd->CommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-        }
-        else
-#endif
-        {
-            vkCmdEndRenderPass(fd->CommandBuffer);
-        }
-        {
-            VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            VkSubmitInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            info.waitSemaphoreCount = 1;
-            info.pWaitSemaphores = &fsd->ImageAcquiredSemaphore;
-            info.pWaitDstStageMask = &wait_stage;
-            info.commandBufferCount = 1;
-            info.pCommandBuffers = &fd->CommandBuffer;
-            info.signalSemaphoreCount = 1;
-            info.pSignalSemaphores = &fsd->RenderCompleteSemaphore;
-
-            err = vkEndCommandBuffer(fd->CommandBuffer);
-            check_vk_result(err);
-            err = vkResetFences(v->Device, 1, &fd->Fence);
-            check_vk_result(err);
-            err = vkQueueSubmit(v->Queue, 1, &info, fd->Fence);
-            check_vk_result(err);
-        }
-    }
-}
-
-void ImGui_ImplVulkan_SwapViewportEx(void* viewport_data)
-{
-    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
-    ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport_data;
-    if (vd == nullptr)
-        return;
-    if (vd->PendingInit)
-        return;
-    if (vd->SwapChainNeedRebuild)
-        return;
-    ImGui_ImplVulkanH_Window* wd = &vd->Window;
-    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
-
-    VkResult err;
-    uint32_t present_index = wd->FrameIndex;
-
-    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
-    VkPresentInfoKHR info = {};
-    info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    info.waitSemaphoreCount = 1;
-    info.pWaitSemaphores = &fsd->RenderCompleteSemaphore;
-    info.swapchainCount = 1;
-    info.pSwapchains = &wd->Swapchain;
-    info.pImageIndices = &present_index;
-    err = vkQueuePresentKHR(v->Queue, &info);
-    if (err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_ERROR_SURFACE_LOST_KHR)
-    {
-        vd->SwapChainNeedRebuild = true;
-        return;
-    }
-    if (err == VK_SUBOPTIMAL_KHR)
-        vd->SwapChainSuboptimal = true;
-    else
-        check_vk_result(err);
-    wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->SemaphoreCount;
 }
 
 void ImGui_ImplVulkan_DestroyViewportResourcesEx(
