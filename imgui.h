@@ -84,7 +84,11 @@ Index of this file:
 #define IMGUI_API
 #endif
 #ifndef IMGUI_IMPL_API
+#if defined(IMGUI_SHARED_CORE)
+#define IMGUI_IMPL_API
+#else
 #define IMGUI_IMPL_API              IMGUI_API
+#endif
 #endif
 
 // Helper Macros

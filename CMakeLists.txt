@@ -38,10 +38,15 @@ set(IMGUI_HEADERS
 
 add_component(
     COMPONENT_NAME  core
-    STATIC
     NAMESPACE       imgui
     OUTPUT_NAME     imgui_core
 	SOURCE_FILES	${IMGUI_CORE_SRCS}
+)
+
+target_compile_definitions(
+    core
+    PRIVATE IMGUI_CORE_LIBRARY
+    PUBLIC IMGUI_SHARED_CORE
 )
 
 component_include_directories(
